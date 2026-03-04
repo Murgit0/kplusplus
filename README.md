@@ -1,6 +1,6 @@
 # K++ Language
 
-`K++` is a Python-compatible interpreter with K++ syntax tweaks for multi-language execution.
+`K++` is a Python-compatible interpreter with syntax tweaks for multi-language execution.
 ```
 !!! THIS LANGUAGE IS UNDER TESTING,DO NOT USE IN PRODUCTION !!!
 ```
@@ -10,7 +10,7 @@
 - Normal Python code runs natively inside the K++ interpreter.
 - K++ adds extra statements for embedding and running other languages.
 
-## K++ syntax tweaks
+## Syntax tweaks
 
 - Optional program start marker: `"prgm.start"`
 - Define embedded script:
@@ -19,7 +19,7 @@
 - Run embedded script: `run.language "<language>" <name>`
 - Run external file: `run.file.language "<language>" <path>`
 
-## Script variable semantics (hard rule)
+## Script variable semantics 
 
 Script variables represent executable or renderable programs, not data values.
 
@@ -42,7 +42,7 @@ If stringification is attempted, K++ raises:
 
 - `Script variables are executable artifacts and cannot be printed.`
 
-## Example (Python + K++)
+## Example (K++)
 
 ```kpp
 "prgm.start"
@@ -110,6 +110,9 @@ If nested language programs prompt for input (`input`, `cin`, etc.), K++ passes 
 - Python code can still generate HTML/CSS files normally, then open them via `run.file.language`.
 
 ## Build one huge binary
+1.Clone the repo
+2.cd into `build`
+3.Run the following
 
 ```bash
 python3 -m venv .venv
@@ -134,23 +137,4 @@ Run all:
 
 ```bash
 make test
-```
-
-## GitHub-ready repo notes
-
-This repository includes:
-
-- `.gitignore` for virtualenvs, caches, and build artifacts
-- `Makefile` targets for smoke/testing/build
-- GitHub Actions workflow at `.github/workflows/ci.yml`
-
-Quick push flow:
-
-```bash
-git init
-git add .
-git commit -m "Initial K++ interpreter"
-git remote add origin <your-repo-url>
-git branch -M main
-git push -u origin main
 ```
