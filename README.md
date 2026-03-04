@@ -16,6 +16,7 @@
   - block delimited by lines exactly equal to `\\\`
 - Run embedded script: `run.language "<language>" <name>`
 - Run external file: `run.file.language "<language>" <path>`
+- Bypassing security tweaks:(add at top of file)`allow.all`
 
 ## Script variable semantics 
 
