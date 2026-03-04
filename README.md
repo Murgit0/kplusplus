@@ -108,7 +108,7 @@ If nested language programs prompt for input (`input`, `cin`, etc.), K++ passes 
 
 ## Build one single binary
 - Clone the repo
-- cd into `build`
+- cd into directory root
 - Run the following
 
 ```bash
