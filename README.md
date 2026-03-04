@@ -1,3 +1,4 @@
+# !!! DO NOT USE RIGHT NOW AS MULTIPLE CRITICAL SECURITY VURNERABILITIES HAVE BEEN FOUND !!!
 # K++ Language
 
 `K++` is a Python-compatible interpreter with syntax tweaks for multi-language execution.
