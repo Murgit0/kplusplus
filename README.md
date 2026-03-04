@@ -1,9 +1,6 @@
 # K++ Language
 
 `K++` is a Python-compatible interpreter with syntax tweaks for multi-language execution.
-```
-!!! THIS LANGUAGE IS UNDER TESTING,DO NOT USE IN PRODUCTION !!!
-```
 
 ## Core model
 
