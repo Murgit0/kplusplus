@@ -109,10 +109,10 @@ If nested language programs prompt for input (`input`, `cin`, etc.), K++ passes 
 - K++ does not parse HTML/CSS; they are treated as rendered artifacts.
 - Python code can still generate HTML/CSS files normally, then open them via `run.file.language`.
 
-## Build one huge binary
-1.Clone the repo
-2.cd into `build`
-3.Run the following
+## Build one single binary
+- Clone the repo
+- cd into `build`
+- Run the following
 
 ```bash
 python3 -m venv .venv
