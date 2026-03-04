@@ -10,19 +10,30 @@ import pathlib
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
-import traceback
+import weakref
 from dataclasses import dataclass, field
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is unavailable on some platforms
+    resource = None  # type: ignore[assignment]
 
 
 PROGRAM_START = '"prgm.start"'
+ALLOW_ALL_MARKER = "allow.all"
 BLOCK_DELIMITER = "\\\\\\"
 DEFINE_RE = re.compile(r'^(\s*)([A-Za-z_]\w*)\s*=\s*define"([^"]+)"(?:\s+depends\s+(.+?))?\s*$')
 RUN_LANGUAGE_RE = re.compile(r'^(\s*)run\.language\s+"([^"]+)"\s+(.+?)\s*$')
 RUN_FILE_LANGUAGE_RE = re.compile(r'^(\s*)run\.file\.language\s+"([^"]+)"\s+(.+?)\s*$')
 EMIT_LANGUAGE_RE = re.compile(r'^(\s*)emit\.language\s+"([^"]+)"\s+(.+?)\s*->\s*(.+?)\s*$')
+LANGUAGE_NAME_RE = re.compile(r"^[a-z0-9_+.#-]+$")
+
+MAX_DEPENDENCY_DEPTH = 256
+MAX_DEPENDENCY_NODES = 4096
 
 LANGUAGE_EXTENSIONS = {
     "python": "py",
@@ -98,21 +109,51 @@ for _family_name, _spec in COMPILED_LANGUAGE_SPECS.items():
 SCRIPT_ARTIFACT_PRINT_ERROR = "Script variables are executable artifacts and cannot be printed."
 
 
-@dataclass
+_ARTIFACT_SOURCE_STORE: dict[int, str] = {}
+_ARTIFACT_SOURCE_FINALIZERS: dict[int, weakref.finalize] = {}
+
+
+def _cleanup_artifact_source_store(artifact_id: int) -> None:
+    _ARTIFACT_SOURCE_STORE.pop(artifact_id, None)
+    _ARTIFACT_SOURCE_FINALIZERS.pop(artifact_id, None)
+
+
+@dataclass(eq=False)
 class ScriptArtifact:
     language: str
-    source: str
     origin: str
     name: str | None = None
     source_path: str | None = None
     dependencies: list["ScriptArtifact"] = field(default_factory=list)
     hash: str = field(init=False)
 
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        language: str,
+        source: str,
+        origin: str,
+        name: str | None = None,
+        source_path: str | None = None,
+        dependencies: list["ScriptArtifact"] | None = None,
+    ) -> None:
+        self.language = language
+        self.origin = origin
+        self.name = name
+        self.source_path = source_path
+        self.dependencies = list(dependencies or [])
         if self.origin not in ("inline", "file"):
             raise RuntimeError(f'Invalid script artifact origin "{self.origin}"')
-        self.dependencies = list(self.dependencies)
-        self.hash = _artifact_content_hash(self.language, self.source, self.origin)
+        artifact_id = id(self)
+        _ARTIFACT_SOURCE_STORE[artifact_id] = source
+        _ARTIFACT_SOURCE_FINALIZERS[artifact_id] = weakref.finalize(
+            self, _cleanup_artifact_source_store, artifact_id
+        )
+        self.hash = _artifact_content_hash(self.language, source, self.origin)
+
+    def __getattribute__(self, name: str) -> object:
+        if name in ("source", "_source"):
+            raise RuntimeError("Script artifact source is opaque and cannot be accessed directly.")
+        return object.__getattribute__(self, name)
 
     def _raise_non_printable(self) -> None:
         raise RuntimeError(SCRIPT_ARTIFACT_PRINT_ERROR)
@@ -132,6 +173,30 @@ class ScriptArtifact:
     def __radd__(self, other: object) -> object:
         self._raise_non_printable()
 
+    def __reduce__(self) -> object:
+        raise RuntimeError("Script variables are executable artifacts and cannot be serialized.")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise RuntimeError("Script variables are executable artifacts and cannot be serialized.")
+
+    def __getstate__(self) -> object:
+        raise RuntimeError("Script variables are executable artifacts and cannot be serialized.")
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ScriptArtifact):
+            return NotImplemented
+        return self.hash == other.hash
+
+    def __hash__(self) -> int:
+        return builtins.hash(self.hash)
+
+
+def _artifact_source(artifact: ScriptArtifact) -> str:
+    source = _ARTIFACT_SOURCE_STORE.get(id(artifact))
+    if source is None:
+        raise RuntimeError("Script artifact source is unavailable.")
+    return source
+
 
 @dataclass(frozen=True)
 class LanguageInfo:
@@ -147,6 +212,8 @@ class SandboxOptions:
     allow_paths: tuple[pathlib.Path, ...]
     timeout_seconds: float | None
     env: dict[str, str]
+    memory_limit_bytes: int | None
+    allow_all: bool = False
 
 
 class KppRuntimeAPI:
@@ -197,7 +264,21 @@ class KppSyntaxError(Exception):
 
 
 def _normalized_language(name: str) -> str:
-    return name.strip().lower().replace(" ", "")
+    if not isinstance(name, str):
+        raise RuntimeError("Language name must be a string.")
+    if "\x00" in name:
+        raise RuntimeError("Invalid language name: null bytes are not allowed.")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise RuntimeError(f"Invalid language name {name!r}: control characters are not allowed.")
+
+    normalized = name.strip().lower().replace(" ", "")
+    if not normalized:
+        raise RuntimeError("Language name cannot be empty.")
+    if not LANGUAGE_NAME_RE.fullmatch(normalized):
+        raise RuntimeError(
+            f"Invalid language name {name!r}: allowed characters are letters, digits, '_', '+', '.', '#', '-'."
+        )
+    return normalized
 
 
 def _artifact_content_hash(language: str, source: str, origin: str) -> str:
@@ -254,10 +335,71 @@ def _compiled_binary_filename() -> str:
     return "program.exe" if os.name == "nt" else "program"
 
 
+def _ensure_private_dir(path: pathlib.Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+
+
 def _compiled_cache_root() -> pathlib.Path:
-    root = pathlib.Path(tempfile.gettempdir()) / "kpp_compiled_cache"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    cache_home = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if cache_home:
+        base = pathlib.Path(cache_home)
+    else:
+        try:
+            base = pathlib.Path.home() / ".cache"
+        except RuntimeError:
+            uid_suffix = str(os.getuid()) if hasattr(os, "getuid") else "user"
+            base = pathlib.Path(tempfile.gettempdir()) / f"kpp_cache_{uid_suffix}"
+
+    preferred_root = base / "kpp" / "compiled_cache"
+    try:
+        _ensure_private_dir(preferred_root)
+        return preferred_root
+    except OSError:
+        uid_suffix = str(os.getuid()) if hasattr(os, "getuid") else "user"
+        fallback_root = pathlib.Path(tempfile.gettempdir()) / f"kpp_cache_{uid_suffix}" / "compiled_cache"
+        _ensure_private_dir(fallback_root)
+        return fallback_root
+
+
+def _file_sha256(path: pathlib.Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _compiled_integrity_path(binary_path: pathlib.Path) -> pathlib.Path:
+    return binary_path.parent / f"{binary_path.name}.sha256"
+
+
+def _write_cached_binary_integrity(binary_path: pathlib.Path) -> None:
+    digest = _file_sha256(binary_path)
+    integrity_path = _compiled_integrity_path(binary_path)
+    integrity_path.write_text(digest + "\n", encoding="utf-8")
+    if os.name != "nt":
+        try:
+            integrity_path.chmod(0o600)
+        except OSError:
+            pass
+
+
+def _validate_cached_binary(binary_path: pathlib.Path) -> None:
+    integrity_path = _compiled_integrity_path(binary_path)
+    if not integrity_path.exists():
+        raise RuntimeError(f"Compiled cache integrity metadata missing: {integrity_path}")
+
+    expected = integrity_path.read_text(encoding="utf-8").strip()
+    actual = _file_sha256(binary_path)
+    if not expected or expected != actual:
+        raise RuntimeError(
+            f"Compiled cache integrity check failed for {binary_path}. Delete the cache entry and retry."
+        )
 
 
 def _compiled_cache_key(family: str, source_code: str, extra_material: str = "") -> str:
@@ -317,9 +459,11 @@ def _compile_inline_with_cache(
     cache_dir = _compiled_cache_root() / family / key
     output_path = cache_dir / _compiled_binary_filename()
     if output_path.exists():
+        if not dry_run:
+            _validate_cached_binary(output_path)
         return output_path
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(cache_dir)
     suffix = COMPILED_LANGUAGE_SPECS[family]["suffix"]
     temp_source_path = _write_temp_compile_source(source_code, suffix)
     try:
@@ -334,6 +478,8 @@ def _compile_inline_with_cache(
         if temp_source_path.exists():
             temp_source_path.unlink()
 
+    if not dry_run:
+        _write_cached_binary_integrity(output_path)
     return output_path
 
 
@@ -353,9 +499,11 @@ def _compile_file_with_cache(
     cache_dir = _compiled_cache_root() / family / key
     output_path = cache_dir / _compiled_binary_filename()
     if output_path.exists():
+        if not dry_run:
+            _validate_cached_binary(output_path)
         return output_path
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(cache_dir)
     command = _compiled_command(
         family=family,
         source_path=source_path,
@@ -363,6 +511,8 @@ def _compile_file_with_cache(
         source_dir_hint=source_path.parent,
     )
     _run_command(command, cwd=base_dir, dry_run=dry_run)
+    if not dry_run:
+        _write_cached_binary_integrity(output_path)
     return output_path
 
 
@@ -406,6 +556,12 @@ def _open_in_browser(target: pathlib.Path, cwd: pathlib.Path, dry_run: bool) -> 
     _run_command(_browser_open_command(target), cwd=cwd, dry_run=dry_run)
 
 
+def _compiled_sandbox_backend() -> str | None:
+    if sys.platform.startswith("linux") and shutil.which("bwrap"):
+        return "bubblewrap"
+    return None
+
+
 def _run_command(
     command: list[str],
     cwd: pathlib.Path,
@@ -436,7 +592,7 @@ def _run_command(
         raise RuntimeError(f"Command failed with exit code {exc.returncode}: {' '.join(command)}") from exc
 
 
-def _load_sandbox_options(base_dir: pathlib.Path) -> SandboxOptions:
+def _load_sandbox_options(base_dir: pathlib.Path, allow_all: bool = False) -> SandboxOptions:
     allowlist_raw = os.environ.get("KPP_SANDBOX_ALLOW_PATHS", "").strip()
     allow_paths: list[pathlib.Path] = []
     if allowlist_raw:
@@ -469,10 +625,23 @@ def _load_sandbox_options(base_dir: pathlib.Path) -> SandboxOptions:
             if env_name in os.environ:
                 sandbox_env[env_name] = os.environ[env_name]
 
+    memory_limit_bytes: int | None = 256 * 1024 * 1024
+    memory_raw = os.environ.get("KPP_SANDBOX_MEMORY_MB", "").strip()
+    if memory_raw:
+        try:
+            memory_limit_mb = float(memory_raw)
+        except ValueError as exc:
+            raise RuntimeError("KPP_SANDBOX_MEMORY_MB must be a valid number of megabytes.") from exc
+        if memory_limit_mb <= 0:
+            raise RuntimeError("KPP_SANDBOX_MEMORY_MB must be greater than zero.")
+        memory_limit_bytes = int(memory_limit_mb * 1024 * 1024)
+
     return SandboxOptions(
         allow_paths=tuple(allow_paths),
         timeout_seconds=timeout_seconds,
         env=sandbox_env,
+        memory_limit_bytes=memory_limit_bytes,
+        allow_all=allow_all,
     )
 
 
@@ -494,8 +663,15 @@ def _artifact_dependency_order(root: ScriptArtifact) -> list[ScriptArtifact]:
     ordered: list[ScriptArtifact] = []
     state: dict[int, int] = {}
     trail: list[ScriptArtifact] = []
+    visited_nodes = 0
 
-    def dfs(node: ScriptArtifact) -> None:
+    def dfs(node: ScriptArtifact, depth: int) -> None:
+        nonlocal visited_nodes
+        if depth > MAX_DEPENDENCY_DEPTH:
+            raise RuntimeError(
+                f"Dependency chain exceeds maximum depth ({MAX_DEPENDENCY_DEPTH})."
+            )
+
         marker = state.get(id(node), 0)
         if marker == 1:
             cycle_nodes = trail + [node]
@@ -505,18 +681,23 @@ def _artifact_dependency_order(root: ScriptArtifact) -> list[ScriptArtifact]:
             return
 
         state[id(node)] = 1
+        visited_nodes += 1
+        if visited_nodes > MAX_DEPENDENCY_NODES:
+            raise RuntimeError(
+                f"Dependency graph exceeds maximum nodes ({MAX_DEPENDENCY_NODES})."
+            )
         trail.append(node)
         for dep in node.dependencies:
             if not isinstance(dep, ScriptArtifact):
                 raise RuntimeError(
                     f'Script variable "{_artifact_label(node)}" has a non-script dependency.'
                 )
-            dfs(dep)
+            dfs(dep, depth + 1)
         trail.pop()
         state[id(node)] = 2
         ordered.append(node)
 
-    dfs(root)
+    dfs(root, depth=1)
     return ordered
 
 
@@ -538,7 +719,7 @@ def _prepare_artifact_build(
         return
     _compile_inline_with_cache(
         family=family,
-        source_code=artifact.source,
+        source_code=_artifact_source(artifact),
         base_dir=base_dir,
         dry_run=dry_run,
         extra_material=_dependency_hash_salt(artifact),
@@ -595,9 +776,9 @@ def _execute_native_python_script(
         if exit_code in (None, 0):
             return
         raise RuntimeError(f"Native Python exited with code {exit_code}") from exc
-    except Exception:
-        traceback.print_exc()
-        raise RuntimeError(f"Native Python script failed: {display_name}") from None
+    except Exception as exc:
+        detail = str(exc) or exc.__class__.__name__
+        raise RuntimeError(f"Native Python script failed: {detail}") from None
     finally:
         sys.argv = previous_argv
         os.chdir(previous_cwd)
@@ -613,6 +794,14 @@ def _execute_sandboxed_python_script(
 ) -> None:
     if dry_run:
         print("$", "kpp-native-python-sandbox", display_name)
+        return
+    if sandbox_options.allow_all:
+        _execute_native_python_script(
+            code=code,
+            display_name=display_name,
+            base_dir=base_dir,
+            dry_run=dry_run,
+        )
         return
 
     safe_builtins: dict[str, object] = {
@@ -638,27 +827,60 @@ def _execute_sandboxed_python_script(
         "RuntimeError": builtins.RuntimeError,
     }
 
-    def safe_open(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+    def _sandbox_resolve_path(path_value: object) -> pathlib.Path:
+        if isinstance(path_value, int):
+            raise RuntimeError("Sandbox denied raw file descriptor access.")
+
+        if isinstance(path_value, (str, bytes, os.PathLike)):
+            fs_path = os.fspath(path_value)
+            if isinstance(fs_path, bytes):
+                fs_path = fs_path.decode(sys.getfilesystemencoding(), errors="surrogateescape")
+            candidate = pathlib.Path(fs_path)
+        else:
+            candidate = pathlib.Path(str(path_value))
+        target = candidate if candidate.is_absolute() else (base_dir / candidate)
+        return target.resolve()
+
+    def _sandbox_require_path(path_value: object) -> pathlib.Path:
         if not sandbox_options.allow_paths:
             raise RuntimeError(
                 "Sandbox filesystem access denied. Configure KPP_SANDBOX_ALLOW_PATHS to allow paths."
             )
-        candidate = pathlib.Path(str(file))
-        resolved = candidate if candidate.is_absolute() else (base_dir / candidate).resolve()
+        resolved = _sandbox_resolve_path(path_value)
         if not _is_path_allowed(resolved, sandbox_options.allow_paths):
             raise RuntimeError(f"Sandbox denied filesystem access: {resolved}")
+        return resolved
+
+    def safe_open(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+        resolved = _sandbox_require_path(file)
         return builtins.open(resolved, mode, *args, **kwargs)
 
     blocked_modules = {
-        "socket",
-        "urllib",
-        "http",
+        "_thread",
+        "atexit",
+        "concurrent",
+        "ctypes",
         "ftplib",
+        "http",
+        "importlib",
+        "io",
+        "linecache",
+        "multiprocessing",
+        "requests",
+        "shutil",
+        "signal",
+        "socket",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "threading",
+        "urllib",
         "ssl",
         "asyncio",
-        "subprocess",
-        "requests",
+        "builtins",
+        "os",
     }
+    blocked_cached_modules = blocked_modules - {"builtins", "sys"}
     original_import = builtins.__import__
 
     def safe_import(
@@ -669,6 +891,10 @@ def _execute_sandboxed_python_script(
         level: int = 0,
     ) -> object:
         root_name = name.split(".")[0]
+        if root_name == "_io":
+            importer_name = globals_obj.get("__name__") if isinstance(globals_obj, dict) else None
+            if importer_name == "__main__":
+                raise RuntimeError('Sandbox blocked import of module "_io".')
         if root_name in blocked_modules:
             raise RuntimeError(f'Sandbox blocked import of module "{root_name}".')
         return original_import(name, globals_obj, locals_obj, fromlist, level)
@@ -686,6 +912,20 @@ def _execute_sandboxed_python_script(
     previous_argv = sys.argv[:]
     previous_cwd = pathlib.Path.cwd()
     previous_logging_handle_error = _install_logging_artifact_guard()
+    previous_sys_modules = dict(sys.modules)
+    previous_sys_state = dict(sys.__dict__)
+    previous_signal_handlers: dict[object, object] = {}
+    if hasattr(signal, "Signals"):
+        for signum in signal.Signals:
+            if signum in (signal.SIGKILL, signal.SIGSTOP):
+                continue
+            try:
+                previous_signal_handlers[signum] = signal.getsignal(signum)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+    import linecache
+    import atexit
 
     import socket
 
@@ -699,28 +939,256 @@ def _execute_sandboxed_python_script(
     if original_create_connection is not None:
         socket.create_connection = blocked_socket  # type: ignore[assignment]
 
+    previous_builtin_import = builtins.__import__
+    builtins.__import__ = safe_import  # type: ignore[assignment]
+
+    original_os_functions: dict[str, object] = {}
+    original_os_fs_functions: dict[str, object] = {}
+    original_pathlib_open = pathlib.Path.open
+    original_shutil_functions: dict[str, object] = {}
+    original_tempfile_functions: dict[str, object] = {}
+    original_linecache_functions: dict[str, object] = {}
+    original_atexit_register = atexit.register
+    original_atexit_unregister = getattr(atexit, "unregister", None)
+    original_thread_start = None
+    original_threading_start = None
+    original_multiprocessing_start = None
+
+    def blocked_os_call(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("Sandbox blocked os process execution.")
+
+    dangerous_os_members = (
+        "system",
+        "popen",
+        "spawnl",
+        "spawnle",
+        "spawnlp",
+        "spawnlpe",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+        "fork",
+        "forkpty",
+        "kill",
+        "killpg",
+        "posix_spawn",
+        "posix_spawnp",
+    )
+    for member in dangerous_os_members:
+        if hasattr(os, member):
+            original_os_functions[member] = getattr(os, member)
+            setattr(os, member, blocked_os_call)
+
+    def safe_listdir(path: object = ".") -> object:
+        resolved = _sandbox_require_path(path)
+        return original_os_fs_functions["listdir"](resolved)
+
+    def safe_scandir(path: object = ".") -> object:
+        resolved = _sandbox_require_path(path)
+        return original_os_fs_functions["scandir"](resolved)
+
+    def safe_walk(top: object, *args: object, **kwargs: object) -> object:
+        resolved = _sandbox_require_path(top)
+        return original_os_fs_functions["walk"](resolved, *args, **kwargs)
+
+    if hasattr(os, "listdir"):
+        original_os_fs_functions["listdir"] = os.listdir
+        os.listdir = safe_listdir  # type: ignore[assignment]
+    if hasattr(os, "scandir"):
+        original_os_fs_functions["scandir"] = os.scandir
+        os.scandir = safe_scandir  # type: ignore[assignment]
+    if hasattr(os, "walk"):
+        original_os_fs_functions["walk"] = os.walk
+        os.walk = safe_walk  # type: ignore[assignment]
+
+    def safe_pathlib_open(
+        self: pathlib.Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> object:
+        resolved = _sandbox_require_path(self)
+        return builtins.open(
+            resolved,
+            mode=mode,
+            buffering=buffering,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+        )
+
+    pathlib.Path.open = safe_pathlib_open  # type: ignore[assignment]
+
+    def safe_shutil_copy(src: object, dst: object, *args: object, **kwargs: object) -> object:
+        return original_shutil_functions["copy"](
+            _sandbox_require_path(src), _sandbox_require_path(dst), *args, **kwargs
+        )
+
+    def safe_shutil_copy2(src: object, dst: object, *args: object, **kwargs: object) -> object:
+        return original_shutil_functions["copy2"](
+            _sandbox_require_path(src), _sandbox_require_path(dst), *args, **kwargs
+        )
+
+    def safe_shutil_copyfile(src: object, dst: object, *args: object, **kwargs: object) -> object:
+        return original_shutil_functions["copyfile"](
+            _sandbox_require_path(src), _sandbox_require_path(dst), *args, **kwargs
+        )
+
+    def safe_shutil_move(src: object, dst: object, *args: object, **kwargs: object) -> object:
+        return original_shutil_functions["move"](
+            _sandbox_require_path(src), _sandbox_require_path(dst), *args, **kwargs
+        )
+
+    def safe_shutil_copytree(src: object, dst: object, *args: object, **kwargs: object) -> object:
+        return original_shutil_functions["copytree"](
+            _sandbox_require_path(src), _sandbox_require_path(dst), *args, **kwargs
+        )
+
+    def safe_shutil_rmtree(path: object, *args: object, **kwargs: object) -> object:
+        return original_shutil_functions["rmtree"](_sandbox_require_path(path), *args, **kwargs)
+
+    for member, replacement in (
+        ("copy", safe_shutil_copy),
+        ("copy2", safe_shutil_copy2),
+        ("copyfile", safe_shutil_copyfile),
+        ("move", safe_shutil_move),
+        ("copytree", safe_shutil_copytree),
+        ("rmtree", safe_shutil_rmtree),
+    ):
+        if hasattr(shutil, member):
+            original_shutil_functions[member] = getattr(shutil, member)
+            setattr(shutil, member, replacement)
+
+    def blocked_tempfile(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("Sandbox blocked tempfile creation.")
+
+    for member in ("NamedTemporaryFile", "mkstemp", "mkdtemp", "TemporaryDirectory"):
+        if hasattr(tempfile, member):
+            original_tempfile_functions[member] = getattr(tempfile, member)
+            setattr(tempfile, member, blocked_tempfile)
+
+    def safe_linecache_getline(filename: object, *args: object, **kwargs: object) -> object:
+        return original_linecache_functions["getline"](
+            str(_sandbox_require_path(filename)), *args, **kwargs
+        )
+
+    def safe_linecache_getlines(filename: object, *args: object, **kwargs: object) -> object:
+        return original_linecache_functions["getlines"](
+            str(_sandbox_require_path(filename)), *args, **kwargs
+        )
+
+    for member, replacement in (("getline", safe_linecache_getline), ("getlines", safe_linecache_getlines)):
+        if hasattr(linecache, member):
+            original_linecache_functions[member] = getattr(linecache, member)
+            setattr(linecache, member, replacement)
+
+    def blocked_atexit_register(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("Sandbox blocked atexit registration.")
+
+    def blocked_atexit_unregister(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("Sandbox blocked atexit registration.")
+
+    atexit.register = blocked_atexit_register  # type: ignore[assignment]
+    if original_atexit_unregister is not None:
+        atexit.unregister = blocked_atexit_unregister  # type: ignore[assignment]
+
+    thread_module = sys.modules.get("_thread")
+    if thread_module is not None and hasattr(thread_module, "start_new_thread"):
+        original_thread_start = getattr(thread_module, "start_new_thread")
+
+        def blocked_start_new_thread(*args: object, **kwargs: object) -> object:
+            raise RuntimeError("Sandbox blocked thread creation.")
+
+        setattr(thread_module, "start_new_thread", blocked_start_new_thread)
+
+    threading_module = sys.modules.get("threading")
+    if threading_module is not None and hasattr(threading_module, "Thread"):
+        thread_type = getattr(threading_module, "Thread")
+        if hasattr(thread_type, "start"):
+            original_threading_start = getattr(thread_type, "start")
+
+            def blocked_thread_start(self: object, *args: object, **kwargs: object) -> object:
+                raise RuntimeError("Sandbox blocked thread creation.")
+
+            setattr(thread_type, "start", blocked_thread_start)
+
+    multiprocessing_module = sys.modules.get("multiprocessing")
+    if multiprocessing_module is not None and hasattr(multiprocessing_module, "Process"):
+        process_type = getattr(multiprocessing_module, "Process")
+        if hasattr(process_type, "start"):
+            original_multiprocessing_start = getattr(process_type, "start")
+
+            def blocked_process_start(self: object, *args: object, **kwargs: object) -> object:
+                raise RuntimeError("Sandbox blocked process creation.")
+
+            setattr(process_type, "start", blocked_process_start)
+
+    ctypes_module = sys.modules.get("ctypes")
+    original_ctypes_members: dict[str, object] = {}
+    if ctypes_module is not None:
+        for member in ("CDLL", "PyDLL", "WinDLL", "OleDLL"):
+            if hasattr(ctypes_module, member):
+                original_ctypes_members[member] = getattr(ctypes_module, member)
+
+                def blocked_ctypes_call(*args: object, **kwargs: object) -> object:
+                    raise RuntimeError("Sandbox blocked ctypes dynamic library loading.")
+
+                setattr(ctypes_module, member, blocked_ctypes_call)
+
+    for module_name in list(sys.modules.keys()):
+        if module_name.split(".")[0] in blocked_cached_modules:
+            sys.modules.pop(module_name, None)
+
     previous_environ = os.environ.copy()
     os.environ.clear()
     os.environ.update(sandbox_options.env)
 
+    memory_limit_installed = False
+    previous_memory_limit: tuple[int, int] | None = None
+
     timer_installed = False
     previous_timer_handler = None
-    timeout_seconds = sandbox_options.timeout_seconds
-    if timeout_seconds is not None:
-        if not hasattr(signal, "SIGALRM"):
-            raise RuntimeError("Sandbox timeout is unavailable on this platform.")
-        previous_timer_handler = signal.getsignal(signal.SIGALRM)
-
-        def handle_timeout(signum: int, frame: object) -> None:
-            raise RuntimeError("Sandbox execution timed out.")
-
-        signal.signal(signal.SIGALRM, handle_timeout)
-        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-        timer_installed = True
-
-    sys.argv = [display_name]
 
     try:
+        if sandbox_options.memory_limit_bytes is not None:
+            if resource is None or not hasattr(resource, "RLIMIT_AS"):
+                raise RuntimeError("Sandbox memory limiting is unavailable on this platform.")
+            try:
+                previous_memory_limit = resource.getrlimit(resource.RLIMIT_AS)
+                _, prev_hard = previous_memory_limit
+                requested = sandbox_options.memory_limit_bytes
+                if prev_hard not in (-1, getattr(resource, "RLIM_INFINITY", -1)) and requested > prev_hard:
+                    requested = prev_hard
+                resource.setrlimit(resource.RLIMIT_AS, (requested, prev_hard))
+                memory_limit_installed = True
+            except (ValueError, OSError) as exc:
+                raise RuntimeError(f"Sandbox failed to configure memory limit: {exc}") from exc
+
+        timeout_seconds = sandbox_options.timeout_seconds
+        if timeout_seconds is not None:
+            if not hasattr(signal, "SIGALRM"):
+                raise RuntimeError("Sandbox timeout is unavailable on this platform.")
+            previous_timer_handler = signal.getsignal(signal.SIGALRM)
+
+            def handle_timeout(signum: int, frame: object) -> None:
+                raise RuntimeError("Sandbox execution timed out.")
+
+            signal.signal(signal.SIGALRM, handle_timeout)
+            signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+            timer_installed = True
+
+        sys.argv = [display_name]
         os.chdir(base_dir)
         exec(compile(code, display_name, "exec"), script_globals, script_globals)
     except SystemExit as exc:
@@ -728,17 +1196,67 @@ def _execute_sandboxed_python_script(
         if exit_code in (None, 0):
             return
         raise RuntimeError(f"Sandboxed Python exited with code {exit_code}") from exc
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        detail = str(exc) or exc.__class__.__name__
+        raise RuntimeError(detail) from None
     finally:
         if timer_installed:
             signal.setitimer(signal.ITIMER_REAL, 0)
             if previous_timer_handler is not None:
                 signal.signal(signal.SIGALRM, previous_timer_handler)
+        if memory_limit_installed and previous_memory_limit is not None:
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, previous_memory_limit)
+            except (ValueError, OSError):
+                pass
 
         os.environ.clear()
         os.environ.update(previous_environ)
         socket.socket = original_socket  # type: ignore[assignment]
         if original_create_connection is not None:
             socket.create_connection = original_create_connection  # type: ignore[assignment]
+        for member, original_callable in original_os_functions.items():
+            setattr(os, member, original_callable)
+        for member, original_callable in original_os_fs_functions.items():
+            setattr(os, member, original_callable)
+        pathlib.Path.open = original_pathlib_open  # type: ignore[assignment]
+        for member, original_callable in original_shutil_functions.items():
+            setattr(shutil, member, original_callable)
+        for member, original_callable in original_tempfile_functions.items():
+            setattr(tempfile, member, original_callable)
+        for member, original_callable in original_linecache_functions.items():
+            setattr(linecache, member, original_callable)
+        atexit.register = original_atexit_register  # type: ignore[assignment]
+        if original_atexit_unregister is not None:
+            atexit.unregister = original_atexit_unregister  # type: ignore[assignment]
+        if thread_module is not None and original_thread_start is not None:
+            setattr(thread_module, "start_new_thread", original_thread_start)
+        if threading_module is not None and original_threading_start is not None:
+            setattr(getattr(threading_module, "Thread"), "start", original_threading_start)
+        if multiprocessing_module is not None and original_multiprocessing_start is not None:
+            setattr(getattr(multiprocessing_module, "Process"), "start", original_multiprocessing_start)
+        if ctypes_module is not None:
+            for member, original_callable in original_ctypes_members.items():
+                setattr(ctypes_module, member, original_callable)
+        for signum, handler in previous_signal_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        for module_name in list(sys.modules.keys()):
+            if module_name not in previous_sys_modules:
+                sys.modules.pop(module_name, None)
+        for module_name, module_obj in previous_sys_modules.items():
+            if sys.modules.get(module_name) is not module_obj:
+                sys.modules[module_name] = module_obj
+        for key in list(sys.__dict__.keys()):
+            if key not in previous_sys_state:
+                sys.__dict__.pop(key, None)
+        for key, value in previous_sys_state.items():
+            sys.__dict__[key] = value
+        builtins.__import__ = previous_builtin_import  # type: ignore[assignment]
         _restore_logging_artifact_guard(previous_logging_handle_error)
         sys.argv = previous_argv
         os.chdir(previous_cwd)
@@ -752,20 +1270,49 @@ def _run_compiled_binary(
     sandbox_options: SandboxOptions | None = None,
 ) -> None:
     if not sandboxed:
+        if not dry_run:
+            _validate_cached_binary(binary_path)
         _run_command([str(binary_path)], cwd=base_dir, dry_run=dry_run)
         return
 
     if sandbox_options is None:
         raise RuntimeError("Sandbox configuration unavailable for compiled execution.")
+    if sandbox_options.allow_all:
+        _run_command([str(binary_path)], cwd=base_dir, dry_run=dry_run)
+        return
+    if not dry_run:
+        _validate_cached_binary(binary_path)
 
-    with tempfile.TemporaryDirectory(prefix="kpp_sandbox_exec_") as sandbox_dir:
+    backend = _compiled_sandbox_backend()
+    if backend is None:
+        raise RuntimeError(
+            "Sandboxed execution for compiled languages is unavailable on this system: no OS isolation backend found."
+        )
+
+    if backend == "bubblewrap":
+        command = [
+            "bwrap",
+            "--die-with-parent",
+            "--unshare-all",
+            "--ro-bind",
+            "/",
+            "/",
+            "--tmpfs",
+            "/tmp",
+            "--chdir",
+            "/tmp",
+            str(binary_path),
+        ]
         _run_command(
-            [str(binary_path)],
-            cwd=pathlib.Path(sandbox_dir),
+            command,
+            cwd=base_dir,
             dry_run=dry_run,
             env=sandbox_options.env,
             timeout_seconds=sandbox_options.timeout_seconds,
         )
+        return
+
+    raise RuntimeError(f'Unsupported compiled sandbox backend "{backend}".')
 
 
 def _run_source_code(
@@ -774,13 +1321,14 @@ def _run_source_code(
     base_dir: pathlib.Path,
     dry_run: bool,
     sandboxed: bool = False,
+    allow_all: bool = False,
     cache_extra_material: str = "",
 ) -> None:
     lang = _normalized_language(language)
 
     if lang in ("python", "python3", "py"):
         if sandboxed:
-            sandbox_options = _load_sandbox_options(base_dir)
+            sandbox_options = _load_sandbox_options(base_dir, allow_all=allow_all)
             _execute_sandboxed_python_script(
                 code=code,
                 display_name="<kpp-inline-python>",
@@ -798,7 +1346,7 @@ def _run_source_code(
         return
 
     if _is_web_artifact_language(lang):
-        if sandboxed:
+        if sandboxed and not allow_all:
             raise RuntimeError(f'Sandboxed execution is unavailable for artifact language "{language}".')
         artifact_path = _write_temp_artifact(code, _artifact_suffix(lang))
         _open_in_browser(artifact_path, cwd=base_dir, dry_run=dry_run)
@@ -806,7 +1354,7 @@ def _run_source_code(
 
     compiled_family = _compiled_language_family(lang)
     if compiled_family is not None:
-        sandbox_options = _load_sandbox_options(base_dir) if sandboxed else None
+        sandbox_options = _load_sandbox_options(base_dir, allow_all=allow_all) if sandboxed else None
         binary_path = _compile_inline_with_cache(
             family=compiled_family,
             source_code=code,
@@ -823,7 +1371,7 @@ def _run_source_code(
         )
         return
 
-    if sandboxed:
+    if sandboxed and not allow_all:
         raise RuntimeError(
             f'Sandboxed execution is currently unavailable for interpreted language "{language}".'
         )
@@ -856,6 +1404,7 @@ def _run_existing_file(
     base_dir: pathlib.Path,
     dry_run: bool,
     sandboxed: bool = False,
+    allow_all: bool = False,
     cache_extra_material: str = "",
 ) -> None:
     target = (
@@ -866,11 +1415,13 @@ def _run_existing_file(
 
     if not target.exists():
         raise RuntimeError(f"File not found for run.file.language: {path_value}")
+    if target.is_dir():
+        raise RuntimeError(f"Path is a directory for run.file.language: {path_value}")
 
     lang = _normalized_language(language)
 
     if _is_web_artifact_language(lang):
-        if sandboxed:
+        if sandboxed and not allow_all:
             raise RuntimeError(f'Sandboxed execution is unavailable for artifact language "{language}".')
         _open_in_browser(target, cwd=base_dir, dry_run=dry_run)
         return
@@ -878,7 +1429,7 @@ def _run_existing_file(
     if lang in ("python", "python3", "py"):
         code = target.read_text(encoding="utf-8")
         if sandboxed:
-            sandbox_options = _load_sandbox_options(base_dir)
+            sandbox_options = _load_sandbox_options(base_dir, allow_all=allow_all)
             _execute_sandboxed_python_script(
                 code=code,
                 display_name=str(target),
@@ -898,7 +1449,7 @@ def _run_existing_file(
     compiled_family = _compiled_language_family(lang)
     if compiled_family is not None:
         source_code = target.read_text(encoding="utf-8")
-        sandbox_options = _load_sandbox_options(base_dir) if sandboxed else None
+        sandbox_options = _load_sandbox_options(base_dir, allow_all=allow_all) if sandboxed else None
         binary_path = _compile_file_with_cache(
             family=compiled_family,
             source_path=target,
@@ -916,7 +1467,7 @@ def _run_existing_file(
         )
         return
 
-    if sandboxed:
+    if sandboxed and not allow_all:
         raise RuntimeError(
             f'Sandboxed execution is currently unavailable for interpreted language "{language}".'
         )
@@ -938,7 +1489,24 @@ def _first_program_start_line(lines: list[str]) -> int | None:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        if _is_allow_all_marker(stripped):
+            continue
         if stripped == PROGRAM_START:
+            return idx
+        return None
+    return None
+
+
+def _is_allow_all_marker(value: str) -> bool:
+    return value in (ALLOW_ALL_MARKER, f'"{ALLOW_ALL_MARKER}"', f"'{ALLOW_ALL_MARKER}'")
+
+
+def _first_allow_all_line(lines: list[str]) -> int | None:
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if _is_allow_all_marker(stripped):
             return idx
         return None
     return None
@@ -984,7 +1552,9 @@ def _normalize_define_dependencies(depends_arg: str | None, line_no: int) -> str
     if depends_arg is None or not depends_arg.strip():
         return "[]"
 
-    parts = [piece for piece in re.split(r"[,\s]+", depends_arg.strip()) if piece]
+    # Support repeated clauses: define"lang" depends a depends b
+    normalized = re.sub(r"\bdepends\b", " ", depends_arg.strip())
+    parts = [piece for piece in re.split(r"[,\s]+", normalized) if piece]
     if not parts:
         return "[]"
 
@@ -1016,10 +1586,16 @@ def transform_kpp_to_python(source: str) -> str:
     lines = source.splitlines()
     out_lines: list[str] = []
 
+    allow_all_line = _first_allow_all_line(lines)
     program_start_line = _first_program_start_line(lines)
     index = 0
     while index < len(lines):
         raw = lines[index]
+
+        if allow_all_line is not None and index == allow_all_line:
+            out_lines.append("")
+            index += 1
+            continue
 
         if program_start_line is not None and index == program_start_line:
             out_lines.append("")
@@ -1103,9 +1679,50 @@ def run_kpp_program(
     script_args: list[str],
     dry_run: bool,
 ) -> None:
+    source_lines = source.splitlines()
+    allow_all_mode = _first_allow_all_line(source_lines) is not None
     transformed = transform_kpp_to_python(source)
     base_dir = kpp_path.resolve().parent
     emitted_paths: set[pathlib.Path] = set()
+    reserved_runtime_names = {"kpp", "lang", "hash", "origin", "type"}
+
+    class _ProtectedRuntimeGlobals(dict):
+        def __init__(self, initial: dict[str, object], reserved_names: set[str]) -> None:
+            self._reserved_names = set(reserved_names)
+            self._locked = False
+            super().__init__(initial)
+            self._locked = True
+
+        def _check_reserved(self, key: object) -> None:
+            if self._locked and isinstance(key, str) and key in self._reserved_names:
+                raise NameError(f'"{key}" is a reserved K++ runtime name and cannot be reassigned.')
+
+        def __setitem__(self, key: object, value: object) -> None:
+            self._check_reserved(key)
+            super().__setitem__(key, value)
+
+        def __delitem__(self, key: object) -> None:
+            self._check_reserved(key)
+            super().__delitem__(key)
+
+        def setdefault(self, key: object, default: object = None) -> object:
+            self._check_reserved(key)
+            return super().setdefault(key, default)
+
+        def pop(self, key: object, *args: object) -> object:
+            self._check_reserved(key)
+            return super().pop(key, *args)
+
+        def update(self, other: object = (), /, **kwargs: object) -> None:
+            if hasattr(other, "keys"):
+                for key in other.keys():  # type: ignore[attr-defined]
+                    self._check_reserved(key)
+            else:
+                for key, _value in other:  # type: ignore[misc]
+                    self._check_reserved(key)
+            for key in kwargs:
+                self._check_reserved(key)
+            super().update(other, **kwargs)
 
     def _require_script_artifact(value: object, context: str) -> ScriptArtifact:
         if isinstance(value, ScriptArtifact):
@@ -1150,11 +1767,50 @@ def run_kpp_program(
         for dep in dependency_order[:-1]:
             _prepare_artifact_build(dep, base_dir=base_dir, dry_run=dry_run)
 
+    def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    def _validate_emit_path(path_value: pathlib.Path, raw_path: pathlib.Path) -> None:
+        if not raw_path.is_absolute() and not _is_within(path_value, base_dir):
+            raise RuntimeError(
+                f"emit.language relative output path escapes script directory: {raw_path}"
+            )
+
+        abspath = pathlib.Path(os.path.abspath(str(path_value)))
+        realpath = pathlib.Path(os.path.realpath(str(path_value)))
+        if realpath != abspath:
+            raise RuntimeError(f"emit.language output path must not traverse symlinks: {path_value}")
+
+        if os.name != "nt":
+            blocked_roots = (pathlib.Path("/dev"), pathlib.Path("/proc"), pathlib.Path("/sys"))
+            for blocked in blocked_roots:
+                if _is_within(path_value, blocked) or path_value == blocked:
+                    raise RuntimeError(f"emit.language output path is not allowed: {path_value}")
+
+        if path_value.exists():
+            try:
+                mode = path_value.lstat().st_mode
+            except OSError as exc:
+                raise RuntimeError(f"emit.language failed to inspect existing path {path_value}: {exc}") from exc
+
+            if stat.S_ISCHR(mode) or stat.S_ISBLK(mode) or stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
+                raise RuntimeError(f"emit.language output path must be a regular file path: {path_value}")
+            raise RuntimeError(f"emit.language output path already exists: {path_value}")
+
     def _resolve_output_path(path_value: object) -> pathlib.Path:
         if isinstance(path_value, ScriptArtifact):
             raise RuntimeError("emit.language output path cannot be a script variable.")
-        raw = pathlib.Path(str(path_value))
-        resolved = raw if raw.is_absolute() else (base_dir / raw).resolve()
+        raw_text = str(path_value).strip()
+        if not raw_text:
+            raise RuntimeError("emit.language output path cannot be empty.")
+        raw = pathlib.Path(raw_text)
+        candidate = raw if raw.is_absolute() else (base_dir / raw)
+        resolved = pathlib.Path(os.path.abspath(str(candidate)))
+        _validate_emit_path(resolved, raw)
         return resolved
 
     def _register_emitted_path(path_value: pathlib.Path) -> None:
@@ -1198,12 +1854,24 @@ def run_kpp_program(
 
         for dep, dep_path in dep_outputs:
             _register_emitted_path(dep_path)
-            dep_path.parent.mkdir(parents=True, exist_ok=True)
-            dep_path.write_text(dep.source, encoding="utf-8")
+            try:
+                dep_path.parent.mkdir(parents=True, exist_ok=True)
+                with dep_path.open("x", encoding="utf-8") as dep_handle:
+                    dep_handle.write(_artifact_source(dep))
+            except FileExistsError as exc:
+                raise RuntimeError(f"emit.language output path already exists: {dep_path}") from exc
+            except OSError as exc:
+                raise RuntimeError(f"emit.language failed writing {dep_path}: {exc}") from exc
 
         _register_emitted_path(root_output)
-        root_output.parent.mkdir(parents=True, exist_ok=True)
-        root_output.write_text(artifact.source, encoding="utf-8")
+        try:
+            root_output.parent.mkdir(parents=True, exist_ok=True)
+            with root_output.open("x", encoding="utf-8") as root_handle:
+                root_handle.write(_artifact_source(artifact))
+        except FileExistsError as exc:
+            raise RuntimeError(f"emit.language output path already exists: {root_output}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"emit.language failed writing {root_output}: {exc}") from exc
 
     def _kpp_define(
         language: str,
@@ -1240,40 +1908,41 @@ def run_kpp_program(
             _build_dependencies_for(script_ref)
             _run_source_code(
                 script_ref.language,
-                script_ref.source,
+                _artifact_source(script_ref),
                 base_dir=base_dir,
                 dry_run=dry_run,
                 sandboxed=sandboxed,
+                allow_all=allow_all_mode,
                 cache_extra_material=_dependency_hash_salt(script_ref),
             )
             return
 
-        if isinstance(script_ref, str):
+        if allow_all_mode and isinstance(script_ref, str):
             _run_source_code(
                 language,
                 script_ref,
                 base_dir=base_dir,
                 dry_run=dry_run,
                 sandboxed=sandboxed,
+                allow_all=allow_all_mode,
             )
             return
 
-        raise RuntimeError(
-            "run.language expects a script created with define\"...\" or a string code expression"
-        )
+        raise RuntimeError("run.language expects a script variable created with define\"...\".")
 
     def _run_artifact_as_file(language: str, artifact: ScriptArtifact, sandboxed: bool = False) -> None:
         _ensure_language_match(language, artifact)
         _build_dependencies_for(artifact)
 
         suffix = _artifact_suffix_for_language(artifact.language)
-        temp_path = _write_temp_artifact(artifact.source, suffix=suffix)
+        temp_path = _write_temp_artifact(_artifact_source(artifact), suffix=suffix)
         _run_existing_file(
             language,
             str(temp_path),
             base_dir=base_dir,
             dry_run=dry_run,
             sandboxed=sandboxed,
+            allow_all=allow_all_mode,
             cache_extra_material=_dependency_hash_salt(artifact),
         )
 
@@ -1282,10 +1951,22 @@ def run_kpp_program(
             _run_artifact_as_file(language, path_value)
             return
         if isinstance(path_value, pathlib.Path):
-            _run_existing_file(language, str(path_value), base_dir=base_dir, dry_run=dry_run)
+            _run_existing_file(
+                language,
+                str(path_value),
+                base_dir=base_dir,
+                dry_run=dry_run,
+                allow_all=allow_all_mode,
+            )
             return
         if isinstance(path_value, str):
-            _run_existing_file(language, path_value, base_dir=base_dir, dry_run=dry_run)
+            _run_existing_file(
+                language,
+                path_value,
+                base_dir=base_dir,
+                dry_run=dry_run,
+                allow_all=allow_all_mode,
+            )
             return
         raise RuntimeError(
             "run.file.language expects a file path (str/pathlib.Path) or a script variable."
@@ -1295,7 +1976,8 @@ def run_kpp_program(
         artifact = _require_script_artifact(script_ref, "emit.language")
         _emit_artifact(language, artifact, output_path)
 
-    runtime_globals: dict[str, object] = {
+    runtime_globals = _ProtectedRuntimeGlobals(
+        {
         "__name__": "__main__",
         "__file__": str(kpp_path),
         "__package__": None,
@@ -1308,7 +1990,9 @@ def run_kpp_program(
         "lang": _kpp_lang,
         "origin": _kpp_origin,
         "hash": _kpp_hash,
-    }
+        },
+        reserved_names=reserved_runtime_names,
+    )
 
     previous_argv = sys.argv[:]
     previous_cwd = pathlib.Path.cwd()
@@ -1365,8 +2049,8 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"Runtime error: {exc}", file=sys.stderr)
         return 1
-    except Exception:
-        traceback.print_exc()
+    except Exception as exc:
+        print(f"Runtime error: {exc}", file=sys.stderr)
         return 1
 
     return 0
