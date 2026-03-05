@@ -3,6 +3,10 @@
 
 `K++` is a Python-compatible interpreter with syntax tweaks for multi-language execution.
 
+## Supported Languages
+K++ right now supports C,Go,HTML,CSS,Python,C++,Rust,Bash(or shell),Javascript,PHP,Perl,Lua,Ruby,Typescript(via `ts-node`),Swift,Java,Zig,Elixir,OCaml,Julia,Deno,and most estoeric/niche langs.
+It supports most languages that are in PATH and do not need extra arguments to interpret/compile(except ones listed above)
+
 ## Core model
 
 - Normal Python code runs natively inside the K++ interpreter.
