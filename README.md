@@ -7,6 +7,7 @@
 
 - Normal Python code runs natively inside the K++ interpreter.
 - K++ adds extra statements for embedding and running other languages.
+- K++ also adds a secure sandbox for code
 
 ## Syntax tweaks
 
