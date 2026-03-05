@@ -1,5 +1,5 @@
 
-# K++ Language
+# The K++ Polyglot Programming Language
 
 `K++` is a Python-compatible interpreter with syntax tweaks for multi-language execution.
 
